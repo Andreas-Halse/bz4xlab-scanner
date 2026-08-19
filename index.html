@@ -79,8 +79,10 @@
       <input type="file" id="seed" accept=".json">
     </label>
     <button id="export">Export capture + state</button>
-    <div class="note">Import <code>state/seed-for-phone.json</code> once so the phone skips
-      what the laptop already probed. Export after every drive and copy both files back.</div>
+    <button id="clearlog">Clear log after exporting</button>
+    <div class="note">Findings are saved on the phone and survive closing the app, so
+      several drives can be exported together. <b>Log size: <span id="logsize">0</span> KB</b>
+      — export and clear before it reaches about 4000 KB.</div>
   </div>
 
   <div id="log" class="sys">Ready.
@@ -103,8 +105,9 @@ const UARTS = [
 const $ = (id) => document.getElementById(id);
 const enc = new TextEncoder(), dec = new TextDecoder();
 let device, writeChar, notifyChar, buffer='', pending=null;
-let running=false, events=[], sessionCount=0, wakeLock=null;
+let running=false, sessionCount=0, wakeLock=null;
 let t0=0, probedThisRun=0;
+let events=[];                  // filled from storage once the helpers exist
 let wantRunning=false;          // survives a suspend; drives automatic resumption
 let audioCtx=null;
 
@@ -143,7 +146,30 @@ function log(text, cls='') {
   while($('log').childElementCount>400) $('log').firstChild.remove();
   $('log').scrollTop=$('log').scrollHeight;
 }
-function rec(o){ events.push({...o,t:Date.now()/1000}); }
+const LOGKEY='bz4xlab.log.v1';
+let logDirty=false, logFull=false;
+function loadLog(){
+  try { const r=localStorage.getItem(LOGKEY); return r?JSON.parse(r):[]; } catch(e){ return []; }
+}
+function rec(o){
+  if(logFull) return;
+  events.push({...o,t:Date.now()/1000});
+  logDirty=true;
+}
+function saveLog(){
+  if(!logDirty) return;
+  try {
+    localStorage.setItem(LOGKEY, JSON.stringify(events));
+    logDirty=false;
+  } catch(e){
+    // Out of room. Stop appending rather than silently dropping the earliest
+    // findings, and make it loud — the data has to be exported now.
+    logFull=true;
+    log('CAPTURE LOG FULL — export now, then press Clear log. Scanning paused.','err');
+    stop();
+  }
+}
+function logBytes(){ try { return (localStorage.getItem(LOGKEY)||'').length; } catch(e){ return 0; } }
 
 function refresh(){
   const ecus=Object.keys(state.ecus);
@@ -156,6 +182,12 @@ function refresh(){
   $('done').textContent=done.toLocaleString();
   $('found').textContent=found.toLocaleString();
   $('session').textContent=sessionCount.toLocaleString();
+  const ls=$('logsize');
+  if(ls){
+    const kb=Math.round(logBytes()/1024);
+    ls.textContent=kb.toLocaleString();
+    ls.style.color = kb>3500 ? 'var(--bad)' : kb>2500 ? 'var(--warn)' : 'var(--dim)';
+  }
   const pct=total?done/total*100:0;
   $('pct').textContent=pct.toFixed(2);
   $('prog').style.width=pct+'%';
@@ -336,11 +368,11 @@ async function scan(){
           log(`  ${tx}/${did}  ${hex(data)}`,'hit');
         }
         if(Date.now()-lastPoll>600000){ lastPoll=Date.now(); await pollAll(); }
-        if(Date.now()-lastSave>8000){ lastSave=Date.now(); save(); refresh(); }
+        if(Date.now()-lastSave>8000){ lastSave=Date.now(); save(); saveLog(); refresh(); }
       }
     }
   }
-  save(); refresh(); stop();
+  save(); saveLog(); refresh(); stop();
 }
 async function pollAll(){
   log('  sampling known identifiers…','sys');
@@ -362,8 +394,8 @@ function stop(){
   $('scan').disabled=false; $('stop').disabled=true;
   try { wakeLock?.release(); } catch(e){}
   wakeLock=null; stopKeepAlive(); setAwake('not held');
-  save(); refresh();
-  log('Stopped. Export before closing.','warn');
+  save(); saveLog(); refresh();
+  log('Stopped. Data is saved on the phone — export when convenient.','warn');
 }
 
 // ---------- import / export
@@ -376,8 +408,13 @@ $('seed').addEventListener('change', async (e)=>{
   save(); refresh();
   log(`Imported ${Object.keys(state.ecus).length} ECUs and prior progress.`,'hit');
 });
+$('clearlog').addEventListener('click', ()=>{
+  if(!confirm('Clear the captured log? Only do this once the exported file is safely off the phone.')) return;
+  events=[]; logFull=false; logDirty=true; saveLog(); refresh();
+  log('Log cleared.','sys');
+});
 $('export').addEventListener('click', ()=>{
-  save();
+  save(); saveLog();
   const stamp=new Date().toISOString().replace(/[:.]/g,'-');
   dl(events.map(e=>JSON.stringify(e)).join('\n'), `bz4x-phone-${stamp}.jsonl`, 'application/x-ndjson');
   setTimeout(()=>dl(JSON.stringify(state), `bz4x-phone-state-${stamp}.json`, 'application/json'), 600);
@@ -405,6 +442,8 @@ document.addEventListener('visibilitychange', async ()=>{
   }
 });
 $('keepalive').addEventListener('change',(e)=>{ e.target.checked?startKeepAlive():stopKeepAlive(); });
+events = loadLog();
+if(events.length) log(`Loaded ${events.length} saved findings from earlier drives.`,'sys');
 if(localStorage.getItem('bz4xlab.want')){
   wantRunning=true;
   log('A scan was interrupted. Connect and it will continue.','warn');
