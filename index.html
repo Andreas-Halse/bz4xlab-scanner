@@ -58,6 +58,17 @@
     <div class="card"><div class="lbl">This session</div><div class="big" id="session">0</div></div>
   </div>
 
+  <div class="card" id="awakecard">
+    <div class="lbl">Screen lock</div>
+    <div id="awake" style="font-size:15px;font-weight:600;margin-top:2px">not held</div>
+    <div class="note" id="awakenote">Tap Start and this should read “held”. If it stays
+      “unavailable”, use Guided Access or the keep-alive below.</div>
+    <label style="display:flex;align-items:center;gap:10px;margin-top:10px;font-size:14px">
+      <input type="checkbox" id="keepalive" style="width:22px;height:22px">
+      Silent audio keep-alive (helps when the screen locks)
+    </label>
+  </div>
+
   <button id="connect" class="primary">Connect OBDLink CX</button>
   <button id="scan" disabled>Start deep scan</button>
   <button id="stop" class="stop" disabled>Stop</button>
@@ -94,6 +105,8 @@ const enc = new TextEncoder(), dec = new TextDecoder();
 let device, writeChar, notifyChar, buffer='', pending=null;
 let running=false, events=[], sessionCount=0, wakeLock=null;
 let t0=0, probedThisRun=0;
+let wantRunning=false;          // survives a suspend; drives automatic resumption
+let audioCtx=null;
 
 // ---------- persistent state
 const KEY='bz4xlab.state.v1';
@@ -180,11 +193,14 @@ async function onDrop(){
   $('status').textContent='Disconnected';
   if(!running) return;
   log('Link dropped — reconnecting…','warn');
-  for(let i=0;i<40 && running;i++){
-    try { await attach(); log('Reconnected.','hit'); return; } catch(e){}
-    await sleep(5000);
+  let tries=0;
+  while(wantRunning){
+    tries++;
+    try { await attach(); log('Reconnected after '+tries+' attempt(s).','hit'); return; } catch(e){}
+    // Keep trying indefinitely: a phone that locked will come back, and a car
+    // that is off simply means the next attempt succeeds on the next drive.
+    await sleep(tries<12 ? 5000 : 20000);
   }
-  if(running){ log('Car appears to be off. Stopping.','warn'); stop(); }
 }
 function onData(e){
   buffer+=dec.decode(e.target.value);
@@ -257,12 +273,44 @@ function order(tx){
   return [...hits].sort((a,b)=>a-b)
     .concat([...near].filter(p=>!hits.has(p)).sort((a,b)=>a-b)).concat(rest);
 }
+async function holdAwake(){
+  // Screen Wake Lock is an app-level request, so it holds the display on even
+  // when a device policy forces a short Auto-Lock. It is dropped whenever the
+  // page is backgrounded, so it has to be re-taken on every return.
+  if(!navigator.wakeLock){ setAwake('unavailable'); return; }
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', ()=>{ setAwake('released'); });
+    setAwake('held');
+  } catch(e){ setAwake('refused: '+e.name); }
+}
+function setAwake(t){
+  const el=$('awake'); if(!el) return;
+  el.textContent=t;
+  el.style.color = t==='held' ? 'var(--ok)' : t==='unavailable'||t.startsWith('refused') ? 'var(--warn)' : 'var(--dim)';
+}
+function startKeepAlive(){
+  // A looping silent tone keeps iOS from suspending the page as aggressively.
+  // It cannot stop the screen locking, but it buys time before work halts.
+  if(audioCtx) return;
+  try {
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+    g.gain.value=0.0001; o.connect(g); g.connect(audioCtx.destination); o.start();
+    log('Keep-alive audio running.','sys');
+  } catch(e){ log('Keep-alive unavailable: '+e.message,'warn'); }
+}
+function stopKeepAlive(){ try{ audioCtx?.close(); }catch(e){} audioCtx=null; }
+
 async function scan(){
   if(!Object.keys(state.ecus).length){ log('Import the state file first.','err'); return; }
-  running=true; $('scan').disabled=true; $('stop').disabled=false;
+  running=true; wantRunning=true;
+  localStorage.setItem('bz4xlab.want','1');
+  $('scan').disabled=true; $('stop').disabled=false;
   t0=Date.now(); probedThisRun=0;
-  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch(e){}
-  log('Deep scan started. Keep this screen on.','hit');
+  await holdAwake();
+  if($('keepalive').checked) startKeepAlive();
+  log('Deep scan started.','hit');
   await init();
 
   const ecus=Object.keys(state.ecus).sort();
@@ -288,7 +336,7 @@ async function scan(){
           log(`  ${tx}/${did}  ${hex(data)}`,'hit');
         }
         if(Date.now()-lastPoll>600000){ lastPoll=Date.now(); await pollAll(); }
-        if(Date.now()-lastSave>30000){ lastSave=Date.now(); save(); refresh(); }
+        if(Date.now()-lastSave>8000){ lastSave=Date.now(); save(); refresh(); }
       }
     }
   }
@@ -309,9 +357,12 @@ async function pollAll(){
   log(`  sampled ${n}`,'sys');
 }
 function stop(){
-  running=false; $('scan').disabled=false; $('stop').disabled=true;
+  running=false; wantRunning=false;
+  localStorage.removeItem('bz4xlab.want');
+  $('scan').disabled=false; $('stop').disabled=true;
   try { wakeLock?.release(); } catch(e){}
-  wakeLock=null; save(); refresh();
+  wakeLock=null; stopKeepAlive(); setAwake('not held');
+  save(); refresh();
   log('Stopped. Export before closing.','warn');
 }
 
@@ -341,8 +392,23 @@ function dl(text,name,type){
 $('connect').addEventListener('click',()=>connect().catch(e=>log('Error: '+e.message,'err')));
 $('scan').addEventListener('click',()=>scan().catch(e=>{log('Error: '+e.message,'err');stop();}));
 $('stop').addEventListener('click',stop);
-document.addEventListener('visibilitychange',()=>{ if(!document.hidden&&running&&!wakeLock)
-  navigator.wakeLock?.request('screen').then(w=>wakeLock=w).catch(()=>{}); });
+// Coming back from a lock: retake the wake lock and pick the scan up again,
+// so an enforced Auto-Lock costs a few seconds rather than the rest of the drive.
+document.addEventListener('visibilitychange', async ()=>{
+  if(document.hidden) return;
+  if(wantRunning){
+    await holdAwake();
+    if(!running && writeChar){
+      log('Resuming after interruption…','warn');
+      scan().catch(e=>log('Error: '+e.message,'err'));
+    }
+  }
+});
+$('keepalive').addEventListener('change',(e)=>{ e.target.checked?startKeepAlive():stopKeepAlive(); });
+if(localStorage.getItem('bz4xlab.want')){
+  wantRunning=true;
+  log('A scan was interrupted. Connect and it will continue.','warn');
+}
 if(!navigator.bluetooth) $('status').textContent='No Web Bluetooth in this browser';
 refresh();
 </script>
