@@ -81,7 +81,9 @@
     </label>
     <button id="export">Export capture + state</button>
     <button id="clearlog">Clear log after exporting</button>
-    <div class="note">Findings are saved on the phone and survive closing the app, so
+    <button id="showtext">Show as text (fallback)</button>
+    <div class="note">Export opens the iOS share sheet — choose AirDrop to send
+      straight to the Mac, or Save to Files. Findings survive closing the app, so
       several drives can be exported together. <b>Log size: <span id="logsize">0</span> KB</b>
       — export and clear before it reaches about 4000 KB.</div>
   </div>
@@ -423,61 +425,46 @@ $('clearlog').addEventListener('click', ()=>{
   events=[]; logFull=false; logDirty=true; saveLog(); refresh();
   log('Log cleared.','sys');
 });
-$('export').addEventListener('click', ()=>{
+$('export').addEventListener('click', async ()=>{
   save(); saveLog();
   const stamp=new Date().toISOString().replace(/[:.]/g,'-');
-  dl(events.map(e=>JSON.stringify(e)).join('\n'), `bz4x-phone-${stamp}.jsonl`, 'application/x-ndjson');
-  setTimeout(()=>dl(JSON.stringify(state), `bz4x-phone-state-${stamp}.json`, 'application/json'), 600);
-  log('Exported capture + state.','hit');
-});
-function dl(text,name,type){
-  const url=URL.createObjectURL(new Blob([text],{type}));
-  const a=Object.assign(document.createElement('a'),{href:url,download:name});
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(()=>URL.revokeObjectURL(url),4000);
-}
-async function findEcus(){
-  running=true; $('findecus').disabled=true; $('scan').disabled=true; $('stop').disabled=false;
-  await holdAwake(); await init();
-  let added=0;
-  // The original sweep only looked at 700-7FF. Diagnostic addresses live
-  // elsewhere on some platforms, so cover the whole 11-bit range, then the
-  // 29-bit scheme, which was never tried at all.
-  log('Sweeping 11-bit 000-7FF…','sys');
-  await raw('ATCM700',2000); await raw('ATCF700',2000);
-  for(let a=0; a<=0x7FF && running; a++){
-    const tx=a.toString(16).toUpperCase().padStart(3,'0');
-    if(state.ecus[tx]) continue;
-    await raw('ATSH'+tx,1500);
-    await raw('ATCRA'+((a+8)&0x7FF).toString(16).toUpperCase().padStart(3,'0'),1500);
-    for(const probe of ['3E00','22F190']){
-      const fs=assemble(frames(await raw(probe,1200)));
-      const hit=fs.find(m=>m.p.length&&(m.p[0]===0x7E||m.p[0]===0x62||m.p[0]===0x7F));
-      if(hit){
-        state.ecus[tx]=hit.h; added++;
-        rec({event:'ecu',tx,rx:hit.h,probe,kind:hit.p[0]===0x7F?'negative':'positive'});
-        log(`  NEW ECU ${tx} -> ${hit.h}`,'hit');
-        break;
-      }
+  const jsonl=events.map(e=>JSON.stringify(e)).join('\n');
+  const st=JSON.stringify(state);
+
+  // iOS WebKit ignores <a download> for blob URLs, so a "download" there does
+  // nothing visible. The share sheet is the route that actually works: it can
+  // AirDrop straight to the Mac or save into Files.
+  try {
+    const files=[
+      new File([jsonl], `bz4x-phone-${stamp}.jsonl`, {type:'text/plain'}),
+      new File([st], `bz4x-phone-state-${stamp}.json`, {type:'application/json'}),
+    ];
+    if(navigator.canShare && navigator.canShare({files})){
+      await navigator.share({files, title:'bz4xlab capture'});
+      log('Shared. AirDrop to the Mac, or Save to Files.','hit');
+      return;
     }
-    if(a%128===0){ save(); saveLog(); refresh(); }
+  } catch(e){
+    if(e && e.name==='AbortError'){ log('Share cancelled.','warn'); return; }
+    log('Share unavailable ('+(e?.message||e)+') — trying download…','warn');
   }
-  log('Sweeping 29-bit 18DAxxF1…','sys');
-  await raw('ATSP7',2000);
-  for(let t=0; t<=0xFF && running; t++){
-    const hh=t.toString(16).toUpperCase().padStart(2,'0');
-    await raw('ATSH18DA'+hh+'F1',1500);
-    await raw('ATCRA18DAF1'+hh,1500);
-    const fs=assemble(frames(await raw('3E00',1200)));
-    const hit=fs.find(m=>m.p.length&&(m.p[0]===0x7E||m.p[0]===0x7F));
-    if(hit){ rec({event:'ecu29',tx:'18DA'+hh+'F1',rx:hit.h}); log(`  NEW 29-bit ECU ${hh}`,'hit'); added++; }
-  }
-  await raw('ATSP6',2000);
-  save(); saveLog(); refresh();
-  log(`Discovery done: ${added} new ECU(s).`, added?'hit':'sys');
-  stop(); $('findecus').disabled=false;
-}
-$('findecus').addEventListener('click',()=>findEcus().catch(e=>{log('Error: '+e.message,'err');stop();}));
+
+  // Desktop browsers, and anything without file sharing.
+  dl(jsonl, `bz4x-phone-${stamp}.jsonl`, 'application/x-ndjson');
+  setTimeout(()=>dl(st, `bz4x-phone-state-${stamp}.json`, 'application/json'), 600);
+  log('Exported via download.','hit');
+});
+$('showtext').addEventListener('click', ()=>{
+  // Last resort: put the data on screen so it can be selected and mailed or
+  // pasted anywhere, for the case where neither sharing nor downloading works.
+  save(); saveLog();
+  const w=window.open('', '_blank');
+  const body = 'STATE\n' + JSON.stringify(state) + '\n\nCAPTURE\n' +
+               events.map(e=>JSON.stringify(e)).join('\n');
+  if(w){ w.document.write('<pre style="white-space:pre-wrap;word-break:break-all;font:11px monospace">'
+    + body.replace(/[&<]/g,c=>c==='&'?'&amp;':'&lt;') + '</pre>'); w.document.close(); }
+  else { log('Popup blocked — allow popups, or use Export.','err'); }
+});
 $('connect').addEventListener('click',()=>connect().catch(e=>log('Error: '+e.message,'err')));
 $('scan').addEventListener('click',()=>scan().catch(e=>{log('Error: '+e.message,'err');stop();}));
 $('stop').addEventListener('click',stop);
